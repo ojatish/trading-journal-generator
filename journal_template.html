@@ -665,8 +665,12 @@ tr:hover td { background: var(--surface2); }
         <div class="cal-month" id="cal-month-label"></div>
         <button class="cal-btn" onclick="calNav(1)">›</button>
       </div>
-      <button class="btn-new" onclick="openForm()" style="font-size:12px;padding:6px 12px;">+ New Trade</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="cal-btn" onclick="calJumpLatest()" title="Jump to latest trades" style="width:auto;padding:0 12px;font-size:11px;color:var(--gold)">Latest ↗</button>
+        <button class="btn-new" onclick="openForm()" style="font-size:12px;padding:6px 12px;">+ New Trade</button>
+      </div>
     </div>
+    <div id="cal-empty-hint" style="display:none;align-items:center;justify-content:center;padding:10px 0 4px;"></div>
     <div class="cal-grid" id="cal-grid"></div>
     <div class="cal-month-stats" id="cal-stats"></div>
   </div>
@@ -1344,7 +1348,14 @@ function renderGallery() {
 function calNav(d) {
   STATE.calMonth += d;
   if (STATE.calMonth > 11) { STATE.calMonth = 0; STATE.calYear++; }
-  if (STATE.calMonth < 0) { STATE.calMonth = 11; STATE.calYear--; }
+  if (STATE.calMonth < 0)  { STATE.calMonth = 11; STATE.calYear--; }
+  renderCalendar();
+}
+function calJump(monthStr) {
+  // monthStr = 'YYYY-MM'
+  const [y, m] = monthStr.split('-');
+  STATE.calYear  = parseInt(y);
+  STATE.calMonth = parseInt(m) - 1;
   renderCalendar();
 }
 function renderCalendar() {
@@ -1352,22 +1363,29 @@ function renderCalendar() {
   const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
   document.getElementById('cal-month-label').textContent = `${monthNames[M]} ${Y}`;
   const first = new Date(Y, M, 1);
-  const last = new Date(Y, M+1, 0);
-  const startDay = first.getDay(); // 0=Sun
+  const last  = new Date(Y, M+1, 0);
+  const startDay = first.getDay();
   const today = new Date(); today.setHours(0,0,0,0);
 
-  // Group trades by date
+  // ── String-based month key (no timezone risk) ──
+  const monthKey = `${Y}-${String(M+1).padStart(2,'0')}`;
+
+  // Group ALL trades by date string
   const byDate = {};
   DB.trades.forEach(t => {
-    const key = t.date;
-    if (!byDate[key]) byDate[key] = [];
-    byDate[key].push(t);
+    if (!t.date) return;
+    if (!byDate[t.date]) byDate[t.date] = [];
+    byDate[t.date].push(t);
   });
+
+  // All months that have at least one trade (sorted)
+  const tradeMonths = [...new Set(
+    DB.trades.filter(t => t.date).map(t => t.date.slice(0,7))
+  )].sort();
 
   const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   let html = days.map(d => `<div class="cal-day-header">${d}</div>`).join('');
 
-  // Prev month padding
   for (let i = 0; i < startDay; i++) {
     const prevDate = new Date(Y, M, -startDay+i+1);
     html += `<div class="cal-cell other-month"><div class="cal-date">${prevDate.getDate()}</div></div>`;
@@ -1397,30 +1415,62 @@ function renderCalendar() {
     </div>`;
   }
 
-  // Next month padding
-  const remaining = 7 - ((startDay + last.getDate()) % 7||7);
+  const remaining = 7 - ((startDay + last.getDate()) % 7 || 7);
   for (let i = 1; i <= remaining && remaining < 7; i++) {
     html += `<div class="cal-cell other-month"><div class="cal-date">${i}</div></div>`;
   }
 
   document.getElementById('cal-grid').innerHTML = html;
 
-  // Month stats
-  const monthTrades = DB.trades.filter(t => {
-    const d = new Date(t.date);
-    return d.getFullYear() === Y && d.getMonth() === M && t.status === 'Filled';
-  });
-  const monthWins = monthTrades.filter(t=>t.result==='Win'||t.result==='Partial');
-  const monthLosses = monthTrades.filter(t=>t.result==='Loss');
+  // ── Smart nav hints ──
+  const prevMonth = tradeMonths.filter(m => m < monthKey).pop();
+  const nextMonth = tradeMonths.filter(m => m > monthKey).shift();
+  const hasThisMonth = tradeMonths.includes(monthKey);
+
+  // Update prev/next buttons to show nearest trade months
+  const prevBtn = document.querySelector('.cal-btn:first-of-type');
+  const nextBtn = document.querySelector('.cal-btn:last-of-type');
+  if (prevBtn) {
+    prevBtn.title = prevMonth ? `← ${prevMonth}` : 'No earlier trades';
+    prevBtn.style.opacity = prevMonth ? '1' : '0.3';
+    prevBtn.onclick = prevMonth ? () => calJump(prevMonth) : null;
+  }
+  if (nextBtn) {
+    nextBtn.title = nextMonth ? `→ ${nextMonth}` : 'No later trades';
+    nextBtn.style.opacity = nextMonth ? '1' : '0.3';
+    nextBtn.onclick = nextMonth ? () => calJump(nextMonth) : null;
+  }
+
+  // ── Empty month hint ──
+  const hint = document.getElementById('cal-empty-hint');
+  if (!hasThisMonth && tradeMonths.length) {
+    const nearest = prevMonth || nextMonth;
+    const [hy, hm] = nearest.split('-');
+    const label = `${monthNames[parseInt(hm)-1]} ${hy}`;
+    const dir = prevMonth ? '←' : '→';
+    hint.style.display = 'flex';
+    hint.innerHTML = `<span style="color:var(--muted2);font-size:13px">No trades this month.</span>
+      <button onclick="calJump('${nearest}')" style="background:var(--surface2);border:1px solid var(--border3);border-radius:var(--r);padding:4px 12px;color:var(--gold);font-size:12px;cursor:pointer;margin-left:8px;">
+        ${dir} Jump to ${label}
+      </button>`;
+  } else {
+    hint.style.display = 'none';
+  }
+
+  // ── Month stats (string comparison — no timezone risk) ──
+  const monthTrades = DB.trades.filter(t => t.date && t.date.slice(0,7) === monthKey && t.status === 'Filled');
+  const monthMissed = DB.trades.filter(t => t.date && t.date.slice(0,7) === monthKey && t.status === 'Missed');
+  const monthWins   = monthTrades.filter(t => t.result==='Win'||t.result==='Partial');
+  const monthLosses = monthTrades.filter(t => t.result==='Loss');
   const monthWrDenom = monthWins.length + monthLosses.length;
-  const monthPnL = monthTrades.reduce((s,t)=>s+(Number(t.pnl)||0),0);
+  const monthPnL = monthTrades.reduce((s,t) => s+(Number(t.pnl)||0), 0);
   document.getElementById('cal-stats').innerHTML = `
     <div class="cal-stat"><div class="cal-stat-label">Filled</div><div class="cal-stat-value">${monthTrades.length}</div></div>
     <div class="cal-stat"><div class="cal-stat-label">Win Rate</div><div class="cal-stat-value" style="color:var(--green)">${monthWrDenom?Math.round(monthWins.length/monthWrDenom*100)+'%':'—'}</div></div>
     <div class="cal-stat"><div class="cal-stat-label">Month PnL</div><div class="cal-stat-value" style="color:${monthPnL>=0?'var(--green)':'var(--red)'}">${fmtPnL(monthPnL)}</div></div>
     <div class="cal-stat"><div class="cal-stat-label">Wins</div><div class="cal-stat-value">${monthWins.length}</div></div>
     <div class="cal-stat"><div class="cal-stat-label">Losses</div><div class="cal-stat-value" style="color:var(--red)">${monthLosses.length}</div></div>
-    <div class="cal-stat"><div class="cal-stat-label">Missed</div><div class="cal-stat-value" style="color:var(--muted)">${DB.trades.filter(t=>{const d=new Date(t.date);return d.getFullYear()===Y&&d.getMonth()===M&&t.status==='Missed';}).length}</div></div>
+    <div class="cal-stat"><div class="cal-stat-label">Missed</div><div class="cal-stat-value" style="color:var(--muted)">${monthMissed.length}</div></div>
   `;
 }
 
@@ -2010,12 +2060,23 @@ function emptyState(title, desc) {
 //  INIT
 // ═══════════════════════════════════════════════════════════════════════
 loadDB();
-// Set calendar to month of most recent trade
-const latestTrade = DB.trades.sort((a,b)=>new Date(b.date)-new Date(a.date))[0];
-if (latestTrade) {
-  const d = new Date(latestTrade.date);
-  STATE.calYear = d.getFullYear(); STATE.calMonth = d.getMonth();
+
+function calJumpLatest() {
+  const dates = DB.trades.filter(t => t.date).map(t => t.date).sort();
+  if (!dates.length) return;
+  calJump(dates[dates.length - 1].slice(0, 7));
 }
+
+// Jump to latest trade month using pure string sort (no timezone issues)
+(function() {
+  const dates = DB.trades.filter(t => t.date).map(t => t.date).sort();
+  if (dates.length) {
+    const latest = dates[dates.length - 1];
+    STATE.calYear  = parseInt(latest.slice(0, 4));
+    STATE.calMonth = parseInt(latest.slice(5, 7)) - 1;
+  }
+})();
+
 render();
 window.addEventListener('resize', () => { if (STATE.view==='dashboard') renderDashboard(); });
 </script>
