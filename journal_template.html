@@ -759,71 +759,126 @@ let STATE = {
   tableSortField: 'date', tableSortDir: 'desc',
 };
 
+
 // ═══════════════════════════════════════════════════════════════════════
-//  PERSISTENCE
+//  STORAGE  — IndexedDB (no quota limit, persistent on file://)
 // ═══════════════════════════════════════════════════════════════════════
-function save() {
-  // Save DB without images (keeps main key small, avoids QuotaExceededError)
-  const slim = { ...DB, trades: DB.trades.map(t => ({ ...t, images: [] })) };
-  try {
-    localStorage.setItem('tj_db', JSON.stringify(slim));
-  } catch(e) {
-    console.warn('tj_db save failed:', e);
-  }
-  // Save each trade's images in its own key
-  DB.trades.forEach(t => {
-    if (!t.images || !t.images.length) return;
-    try {
-      localStorage.setItem('tj_img_' + t.id, JSON.stringify(t.images));
-    } catch(e) {
-      // Individual image key too big — try saving one at a time
-      t.images.forEach((img, i) => {
-        try { localStorage.setItem('tj_img_' + t.id + '_' + i, img); } catch(e2) {}
-      });
-    }
+function _idb() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open('tj_v1', 1);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('data'))   db.createObjectStore('data');
+      if (!db.objectStoreNames.contains('images')) db.createObjectStore('images');
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = () => rej(req.error);
+  });
+}
+async function idbGet(store, key) {
+  const db = await _idb();
+  return new Promise(res => {
+    const r = db.transaction(store,'readonly').objectStore(store).get(key);
+    r.onsuccess = () => res(r.result ?? null);
+    r.onerror   = () => res(null);
+  });
+}
+async function idbSet(store, key, val) {
+  const db = await _idb();
+  return new Promise(res => {
+    const tx = db.transaction(store,'readwrite');
+    tx.objectStore(store).put(val, key);
+    tx.oncomplete = () => res();
+    tx.onerror    = () => res();
+  });
+}
+async function idbDel(store, key) {
+  const db = await _idb();
+  return new Promise(res => {
+    const tx = db.transaction(store,'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = () => res();
+    tx.onerror    = () => res();
+  });
+}
+async function idbKeys(store) {
+  const db = await _idb();
+  return new Promise(res => {
+    const r = db.transaction(store,'readonly').objectStore(store).getAllKeys();
+    r.onsuccess = () => res(r.result ?? []);
+    r.onerror   = () => res([]);
   });
 }
 
-function loadDB() {
-  const stored = localStorage.getItem('tj_db');
-  if (stored) {
-    try {
-      DB = JSON.parse(stored);
-      // Re-attach images from their individual keys
-      DB.trades.forEach(t => {
-        // Try combined key first
-        const combined = localStorage.getItem('tj_img_' + t.id);
-        if (combined) {
-          try { t.images = JSON.parse(combined); return; } catch(e) {}
-        }
-        // Fall back to individual per-image keys
-        const imgs = [];
-        for (let i = 0; i < 20; i++) {
-          const img = localStorage.getItem('tj_img_' + t.id + '_' + i);
-          if (!img) break;
-          imgs.push(img);
-        }
-        if (imgs.length) t.images = imgs;
-      });
-    } catch(e) { DB = { trades: [], nextId: 1 }; }
+// save/load — metadata separate from images
+async function save() {
+  const slim = DB.trades.map(t => ({ ...t, images: [] }));
+  await idbSet('data', 'trades', slim);
+  await idbSet('data', 'meta',   { nextId: DB.nextId });
+}
+async function saveImages(tradeId, images) {
+  if (images && images.length) {
+    await idbSet('images', tradeId, images.filter(x => x && x !== '__pending__'));
   } else {
-    DB.trades = JSON.parse(JSON.stringify(SEED_TRADES)); save();
+    await idbDel('images', tradeId);
+  }
+}
+async function loadDB() {
+  const stored = await idbGet('data', 'trades');
+  if (stored && stored.length) {
+    const meta = await idbGet('data', 'meta') || {};
+    DB.trades  = stored;
+    DB.nextId  = meta.nextId || stored.length + 1;
+    // Re-attach images
+    for (const t of DB.trades) {
+      const imgs = await idbGet('images', t.id);
+      t.images = imgs || [];
+    }
+  } else {
+    // First run — try migrating from old localStorage
+    const old = localStorage.getItem('tj_db');
+    if (old) {
+      try {
+        const parsed = JSON.parse(old);
+        DB = parsed;
+        // migrate old per-trade image keys
+        for (const t of DB.trades) {
+          const combined = localStorage.getItem('tj_img_' + t.id);
+          if (combined) { try { t.images = JSON.parse(combined); } catch(e){} }
+        }
+      } catch(e) { DB.trades = JSON.parse(JSON.stringify(SEED_TRADES)); }
+    } else {
+      DB.trades = JSON.parse(JSON.stringify(SEED_TRADES));
+    }
+    // Persist to IDB
+    for (const t of DB.trades) {
+      await saveImages(t.id, t.images || []);
+    }
+    await save();
+    // Clean up localStorage to avoid confusion
+    try { localStorage.removeItem('tj_db'); } catch(e){}
   }
 }
 
 function exportData() {
-  // DB.trades already have images re-attached by loadDB — export the full thing
-  const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify(DB, null, 2)], { type:'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
   a.download = `trading-journal-${new Date().toISOString().slice(0,10)}.json`; a.click();
 }
 function importData() { document.getElementById('json-import-input').click(); }
 function handleImport(file) {
   if (!file) return;
-  const r = new FileReader(); r.onload = e => {
-    try { DB = JSON.parse(e.target.result); save(); render(); alert('Imported successfully!'); }
-    catch(err) { alert('Invalid JSON file'); }
-  }; r.readAsText(file);
+  const r = new FileReader();
+  r.onload = async e => {
+    try {
+      DB = JSON.parse(e.target.result);
+      for (const t of DB.trades) await saveImages(t.id, t.images||[]);
+      await save();
+      render();
+      alert('Imported successfully!');
+    } catch(err) { alert('Invalid JSON file'); }
+  };
+  r.readAsText(file);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1523,6 +1578,7 @@ function openModal(id) {
       </div>
       <div class="modal-header-actions">
         <button class="edit-btn" onclick="openForm('${t.id}')">Edit</button>
+        <button class="edit-btn" onclick="renameTrade('${t.id}')" title="Rename trade ID">✎ Rename</button>
         <button class="edit-btn del-btn" onclick="deleteTrade('${t.id}')">Delete</button>
         <button class="modal-close" onclick="closeModal()">✕</button>
       </div>
@@ -1579,15 +1635,33 @@ function closeModal(e) {
   if (e && e.target !== document.getElementById('modal-overlay')) return;
   document.getElementById('modal-overlay').classList.remove('open');
 }
-function deleteTrade(id) {
+async function deleteTrade(id) {
   if (!confirm(`Delete trade ${id}? This cannot be undone.`)) return;
   DB.trades = DB.trades.filter(t => t.id !== id);
-  // Clean up image keys
-  localStorage.removeItem('tj_img_' + id);
-  for (let i = 0; i < 20; i++) localStorage.removeItem('tj_img_' + id + '_' + i);
-  save();
+  await idbDel('images', id);
+  await save();
   document.getElementById('modal-overlay').classList.remove('open');
   render();
+}
+
+async function renameTrade(oldId) {
+  const newId = prompt('Enter new trade ID:', oldId);
+  if (!newId || newId === oldId) return;
+  newId2 = newId.trim().toUpperCase();
+  if (!newId2) return;
+  if (DB.trades.find(t => t.id === newId2)) { alert('That ID already exists.'); return; }
+  const t = DB.trades.find(t => t.id === oldId);
+  if (!t) return;
+  // Move images
+  const imgs = await idbGet('images', oldId);
+  await idbDel('images', oldId);
+  if (imgs) await idbSet('images', newId2, imgs);
+  t.id = newId2;
+  if (imgs) t.images = imgs;
+  await save();
+  document.getElementById('modal-overlay').classList.remove('open');
+  render();
+  openModal(newId2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1954,17 +2028,20 @@ async function submitForm() {
     btn.disabled = false;
   }
 
-  d.images = [...STATE.formImages];
+  d.images = STATE.formImages.filter(x => x && x !== '__pending__');
 
   if (STATE.formEditId) {
     const i = DB.trades.findIndex(t => t.id === STATE.formEditId);
     if (i >= 0) DB.trades[i] = { ...DB.trades[i], ...d };
+    await saveImages(STATE.formEditId, d.images);
   } else {
     d.id = nextTradeId(d.pair);
     d.createdAt = new Date().toISOString();
     DB.trades.push(d);
+    await saveImages(d.id, d.images);
   }
-  save(); closeForm(); render();
+  await save();
+  closeForm(); render();
   if (STATE.formEditId) openModal(STATE.formEditId);
 }
 
@@ -2059,26 +2136,28 @@ function emptyState(title, desc) {
 // ═══════════════════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════════════════
-loadDB();
-
 function calJumpLatest() {
   const dates = DB.trades.filter(t => t.date).map(t => t.date).sort();
   if (!dates.length) return;
   calJump(dates[dates.length - 1].slice(0, 7));
 }
 
-// Jump to latest trade month using pure string sort (no timezone issues)
-(function() {
+(async function init() {
+  // Show loading state
+  document.getElementById('main').style.opacity = '0';
+  await loadDB();
+  // Jump calendar to latest trade month
   const dates = DB.trades.filter(t => t.date).map(t => t.date).sort();
   if (dates.length) {
     const latest = dates[dates.length - 1];
     STATE.calYear  = parseInt(latest.slice(0, 4));
     STATE.calMonth = parseInt(latest.slice(5, 7)) - 1;
   }
+  render();
+  document.getElementById('main').style.transition = 'opacity 0.3s';
+  document.getElementById('main').style.opacity = '1';
+  window.addEventListener('resize', () => { if (STATE.view==='dashboard') renderDashboard(); });
 })();
-
-render();
-window.addEventListener('resize', () => { if (STATE.view==='dashboard') renderDashboard(); });
 </script>
 </body>
 </html>
