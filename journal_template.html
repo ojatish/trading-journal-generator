@@ -614,6 +614,7 @@ tr:hover td { background: var(--surface2); }
     <button class="btn-new" onclick="openForm()">+ New Trade</button>
     <button class="btn-icon" onclick="exportData()" title="Export JSON">⬇</button>
     <button class="btn-icon" onclick="importData()" title="Import JSON">⬆</button>
+    <button class="btn-icon" onclick="confirmClearAll()" title="Clear all trades" style="color:var(--red)">⌫</button>
   </div>
 </nav>
 
@@ -748,6 +749,29 @@ tr:hover td { background: var(--surface2); }
 <div id="lightbox" onclick="closeLightbox()">
   <span class="lightbox-close" onclick="closeLightbox()">✕</span>
   <img id="lightbox-img" src="" alt="">
+</div>
+
+<!-- CLEAR ALL MODAL -->
+<div id="clear-modal" style="display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,0.88);backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:20px;">
+  <div style="background:#0c0c0c;border:1px solid #2e2e2e;border-radius:14px;max-width:420px;width:100%;padding:32px;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,0.7);">
+    <div style="font-size:36px;margin-bottom:16px;">🗑️</div>
+    <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#e4e4e4;margin-bottom:8px;">Clear All Trades?</div>
+    <div style="font-size:13px;color:#666;line-height:1.65;margin-bottom:28px;">
+      This will permanently delete <strong id="clear-trade-count" style="color:#e4e4e4">all trades</strong> and their screenshots from this browser.<br>
+      <span style="color:#c96060">This cannot be undone.</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <button onclick="clearWithBackup()" style="width:100%;padding:11px;border-radius:8px;background:#c8a84b;color:#000;font-weight:700;font-family:'Syne',sans-serif;font-size:14px;border:none;cursor:pointer;">
+        ⬇ Backup &amp; Clear
+      </button>
+      <button onclick="clearWithoutBackup()" style="width:100%;padding:11px;border-radius:8px;background:#1a1a1a;color:#c96060;font-weight:600;font-size:14px;border:1px solid #2e2e2e;cursor:pointer;">
+        Clear Without Backup
+      </button>
+      <button onclick="closeClearModal()" style="width:100%;padding:10px;border-radius:8px;background:transparent;color:#555;font-size:13px;border:1px solid #1a1a1a;cursor:pointer;">
+        Cancel
+      </button>
+    </div>
+  </div>
 </div>
 
 <!-- HIDDEN FILE INPUT -->
@@ -941,7 +965,43 @@ async function handleImport(file) {
   }
 }
 
-// ── Toast notification ─────────────────────────────────────────────────
+// ── Clear all trades ──────────────────────────────────────────────────
+function confirmClearAll() {
+  const n = DB.trades.length;
+  if (!n) { showToast('No trades to clear'); return; }
+  const el = document.getElementById('clear-trade-count');
+  if (el) el.textContent = `${n} trade${n!==1?'s':''}`;
+  const modal = document.getElementById('clear-modal');
+  modal.style.display = 'flex';
+}
+function closeClearModal() {
+  document.getElementById('clear-modal').style.display = 'none';
+}
+async function clearWithBackup() {
+  await exportData();          // downloads backup first
+  await _doClear();
+}
+async function clearWithoutBackup() {
+  closeClearModal();
+  await _doClear();
+}
+async function _doClear() {
+  closeClearModal();
+  // Wipe all image keys from IDB
+  const keys = await idbKeys('images');
+  for (const k of keys) await idbDel('images', k);
+  // Wipe trade metadata
+  await idbDel('data', 'trades');
+  await idbDel('data', 'meta');
+  // Reset in-memory DB
+  DB = { trades: [], nextId: 1 };
+  // Show empty state banner
+  const banner = document.getElementById('empty-state-banner');
+  if (banner) banner.style.display = 'block';
+  updateStorageStatus();
+  render();
+  showToast('All trades cleared');
+}
 let _toastTimer = null;
 function showToast(msg, duration = 2800) {
   let el = document.getElementById('tj-toast');
