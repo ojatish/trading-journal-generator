@@ -610,6 +610,7 @@ tr:hover td { background: var(--surface2); }
   </div>
   <div class="nav-actions">
     <input class="search-input" type="text" placeholder="Search trades…" id="globalSearch" oninput="onSearch(this.value)">
+    <div id="storage-dot" title="Storage status" style="width:8px;height:8px;border-radius:50%;background:#555;flex-shrink:0;cursor:help;transition:background .3s;margin-right:2px;" onclick="updateStorageStatus()"></div>
     <button class="btn-new" onclick="openForm()">+ New Trade</button>
     <button class="btn-icon" onclick="exportData()" title="Export JSON">⬇</button>
     <button class="btn-icon" onclick="importData()" title="Import JSON">⬆</button>
@@ -620,6 +621,24 @@ tr:hover td { background: var(--surface2); }
 <div id="main">
   <!-- DASHBOARD -->
   <div id="view-dashboard" class="view active">
+    <div id="empty-state-banner" style="display:none;background:#0c0c0c;border:1px solid #2e2e2e;border-radius:12px;padding:28px 32px;margin-bottom:20px;text-align:center;">
+      <div style="font-size:28px;margin-bottom:12px;">📂</div>
+      <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:700;color:#e4e4e4;margin-bottom:8px;">No trades found in this browser</div>
+      <div style="font-size:13px;color:#666;line-height:1.7;max-width:480px;margin:0 auto 18px;">
+        Trading Journal stores data in <strong style="color:#a0a0a0">IndexedDB</strong>, which is separate per browser.<br>
+        If you were using another browser, export your data there first, then import it here.
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+        <div style="background:#141414;border:1px solid #222;border-radius:8px;padding:12px 16px;font-size:12px;color:#888;text-align:left;max-width:200px;">
+          <div style="color:#c8a84b;font-weight:700;margin-bottom:4px;">Step 1 — Old browser</div>
+          Click the <strong style="color:#e4e4e4">⬇</strong> button to export your JSON backup
+        </div>
+        <div style="background:#141414;border:1px solid #222;border-radius:8px;padding:12px 16px;font-size:12px;color:#888;text-align:left;max-width:200px;">
+          <div style="color:#c8a84b;font-weight:700;margin-bottom:4px;">Step 2 — This browser</div>
+          Click the <strong style="color:#e4e4e4">⬆</strong> button and select the exported JSON file
+        </div>
+      </div>
+    </div>
     <div class="dash-grid" id="kpi-grid"></div>
     <div class="chart-row">
       <div class="chart-card">
@@ -860,25 +879,98 @@ async function loadDB() {
   }
 }
 
-function exportData() {
-  const blob = new Blob([JSON.stringify(DB, null, 2)], { type:'application/json' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-  a.download = `trading-journal-${new Date().toISOString().slice(0,10)}.json`; a.click();
+async function exportData() {
+  // Re-fetch all images from IDB before exporting so nothing is missing
+  const btn = document.querySelector('[onclick="exportData()"]');
+  if (btn) { btn.textContent = '…'; btn.style.pointerEvents = 'none'; }
+  try {
+    for (const t of DB.trades) {
+      const imgs = await idbGet('images', t.id);
+      t.images = imgs || [];
+    }
+    const json  = JSON.stringify(DB, null, 2);
+    const blob  = new Blob([json], { type: 'application/json' });
+    const sizeMB = (blob.size / 1048576).toFixed(1);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `trading-journal-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    if (btn) btn.textContent = '⬇';
+    showToast(`Exported ${DB.trades.length} trades (${sizeMB} MB)`);
+  } catch(e) {
+    if (btn) btn.textContent = '⬇';
+    alert('Export failed: ' + e.message);
+  } finally {
+    if (btn) btn.style.pointerEvents = '';
+  }
 }
+
 function importData() { document.getElementById('json-import-input').click(); }
-function handleImport(file) {
+
+async function handleImport(file) {
   if (!file) return;
-  const r = new FileReader();
-  r.onload = async e => {
-    try {
-      DB = JSON.parse(e.target.result);
-      for (const t of DB.trades) await saveImages(t.id, t.images||[]);
-      await save();
-      render();
-      alert('Imported successfully!');
-    } catch(err) { alert('Invalid JSON file'); }
-  };
-  r.readAsText(file);
+  showToast('Reading file…', 999999);
+  try {
+    const text = await file.text();
+    showToast('Parsing data…', 999999);
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch(e) { hideToast(); alert('Invalid JSON — file may be corrupted.'); return; }
+
+    if (!parsed.trades || !Array.isArray(parsed.trades)) {
+      hideToast(); alert('Invalid format — no trades array found.'); return;
+    }
+
+    DB = parsed;
+    let done = 0;
+    for (const t of DB.trades) {
+      await saveImages(t.id, t.images || []);
+      done++;
+      if (done % 3 === 0) showToast(`Saving trade ${done}/${DB.trades.length}…`, 999999);
+    }
+    await save();
+    render();
+    const banner = document.getElementById('empty-state-banner');
+    if (banner) banner.style.display = 'none';
+    updateStorageStatus();
+    hideToast();
+    showToast(`✓ Imported ${DB.trades.length} trades`);
+  } catch(e) {
+    hideToast();
+    alert('Import failed: ' + e.message);
+  }
+}
+
+// ── Toast notification ─────────────────────────────────────────────────
+let _toastTimer = null;
+function showToast(msg, duration = 2800) {
+  let el = document.getElementById('tj-toast');
+  if (!el) {
+    el = document.createElement('div'); el.id = 'tj-toast';
+    el.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+      background:#1a1a1a;border:1px solid #2e2e2e;color:#e4e4e4;
+      padding:9px 18px;border-radius:8px;font-size:13px;z-index:9999;
+      font-family:'DM Sans',sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.6);
+      transition:opacity .2s;white-space:nowrap;`;
+    document.body.appendChild(el);
+  }
+  el.textContent = msg; el.style.opacity = '1';
+  clearTimeout(_toastTimer);
+  if (duration < 999999) _toastTimer = setTimeout(hideToast, duration);
+}
+function hideToast() {
+  const el = document.getElementById('tj-toast');
+  if (el) { el.style.opacity = '0'; }
+}
+
+// ── Storage status dot in nav ──────────────────────────────────────────
+async function updateStorageStatus() {
+  const stored = await idbGet('data', 'trades');
+  const count  = stored ? stored.length : 0;
+  const dot    = document.getElementById('storage-dot');
+  if (!dot) return;
+  dot.title   = count ? `IDB: ${count} trades stored` : 'No data in storage yet';
+  dot.style.background = count ? '#22c55e' : '#ef4444';
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2154,6 +2246,10 @@ function calJumpLatest() {
     STATE.calMonth = parseInt(latest.slice(5, 7)) - 1;
   }
   render();
+  // Show empty-state banner if no trades
+  const banner = document.getElementById('empty-state-banner');
+  if (banner) banner.style.display = DB.trades.length === 0 ? 'block' : 'none';
+  updateStorageStatus();
   document.getElementById('main').style.transition = 'opacity 0.3s';
   document.getElementById('main').style.opacity = '1';
   window.addEventListener('resize', () => { if (STATE.view==='dashboard') renderDashboard(); });
